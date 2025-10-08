@@ -1,0 +1,68 @@
+# Configuration for Stage 2: FLUX Integration Training
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+train_data: "./data/train"  # Path to training data
+val_data: "./data/val"      # Path to validation data
+image_size: 512             # Input image size
+mask_ratio: 0.5             # Ratio for random mask generation (if no mask provided)
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+flux_model_id: "black-forest-labs/FLUX.1-Fill-dev"  # HuggingFace model ID
+decomposition_checkpoint: "./checkpoints/decomposition/best_model.pth"  # Pretrained decomposition
+lora_rank: 16               # LoRA rank (lower = fewer parameters)
+lora_alpha: 32              # LoRA alpha (typically 2x rank)
+freeze_decomposition: true  # Freeze decomposition network during FLUX training
+
+num_material_classes: 32    # Must match decomposition pretraining
+context_channels: 8         # Must match decomposition pretraining
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+batch_size: 4               # Smaller batch size for FLUX (memory intensive)
+num_epochs: 50              # Number of training epochs
+learning_rate: 0.00001      # Lower learning rate for fine-tuning (1e-5)
+weight_decay: 0.000001      # Weight decay (1e-6)
+num_workers: 2              # Fewer workers for large models
+
+# ============================================================================
+# Logging and Checkpointing
+# ============================================================================
+checkpoint_dir: "./checkpoints/flux"      # Directory for model checkpoints
+log_dir: "./logs/flux"                    # Directory for TensorBoard logs
+vis_dir: "./visualizations/flux"          # Directory for visualizations
+
+log_interval: 20      # Log training metrics every N batches
+val_interval: 2       # Run validation every N epochs (more frequent for monitoring)
+save_interval: 5      # Save checkpoint every N epochs
+
+# ============================================================================
+# Notes
+# ============================================================================
+# IMPORTANT: This configuration is for the FLUX integration training phase.
+#
+# Prerequisites:
+# 1. Complete Stage 1 (decomposition pretraining) first
+# 2. Update 'decomposition_checkpoint' to point to your trained model
+# 3. Ensure you have access to FLUX.1-Fill-dev (requires HuggingFace authentication)
+#
+# Memory Requirements:
+# - FLUX is VERY large (~12GB model)
+# - Recommended: 40GB+ GPU VRAM (A100)
+# - Minimum: 24GB GPU VRAM (RTX 3090/4090) with batch_size=1
+# - Use gradient checkpointing if OOM
+#
+# Training Tips:
+# - Start with freeze_decomposition=true to stabilize training
+# - After convergence, optionally unfreeze for joint fine-tuning (Stage 3)
+# - Monitor validation visualizations to check quality
+# - Lower learning_rate further if training is unstable
+#
+# LoRA Configuration:
+# - rank=16, alpha=32 is a good starting point
+# - Increase rank for more expressiveness (but more memory)
+# - Decrease rank for faster training and less overfitting

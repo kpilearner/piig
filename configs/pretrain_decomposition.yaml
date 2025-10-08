@@ -1,0 +1,59 @@
+# Configuration for Stage 1: Decomposition Network Pretraining
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+train_data: "./data/train"  # Path to training data (contains rgb/ and infrared/ subdirs)
+val_data: "./data/val"      # Path to validation data
+image_size: 512             # Input image size
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+backbone: "resnet50"              # Backbone architecture: resnet18 or resnet50
+num_material_classes: 32          # Number of material classes for classification
+context_channels: 8               # Number of context feature channels
+fusion_hidden_dim: 64             # Hidden dimension for physics-inspired fusion
+
+# ============================================================================
+# Loss Weights
+# ============================================================================
+lambda_intensity: 1.0    # Weight for intensity loss
+lambda_material: 1.0     # Weight for material classification loss
+lambda_context: 0.5      # Weight for context loss
+lambda_fusion: 2.0       # Weight for fusion reconstruction loss
+
+# ============================================================================
+# Pseudo-Label Generation
+# ============================================================================
+material_method: "simple"  # Method for material pseudo-labels: "kmeans" or "simple"
+                          # "simple" is faster, "kmeans" is more accurate
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+batch_size: 8              # Batch size (adjust based on GPU memory)
+num_epochs: 100            # Number of training epochs
+learning_rate: 0.0001      # Initial learning rate (1e-4)
+weight_decay: 0.00001      # Weight decay for regularization (1e-5)
+num_workers: 4             # Number of data loading workers
+
+# ============================================================================
+# Logging and Checkpointing
+# ============================================================================
+checkpoint_dir: "./checkpoints/decomposition"     # Directory for model checkpoints
+log_dir: "./logs/decomposition"                   # Directory for TensorBoard logs
+vis_dir: "./visualizations/decomposition"         # Directory for visualizations
+
+log_interval: 50      # Log training metrics every N batches
+val_interval: 1       # Run validation every N epochs
+save_interval: 10     # Save checkpoint every N epochs
+
+# ============================================================================
+# Notes
+# ============================================================================
+# - Adjust batch_size based on your GPU memory (8 for 24GB GPU, 4 for 12GB)
+# - Use "simple" material_method for faster training during development
+# - Use "kmeans" material_method for better quality (slower)
+# - lambda_fusion is highest because final infrared reconstruction is most important
+# - lambda_context is lower because context is more abstract
