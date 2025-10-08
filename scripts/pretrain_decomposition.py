@@ -1,405 +1,375 @@
 """
-Stage 1: Pretrain Decomposition Network
+阶段1: 分解网络预训练
 
-Train the multi-task decomposition network with pseudo-labels generated
-from RGB-Infrared pairs.
+训练多任务分解网络学习物理启发的表示：
+- Intensity: 类似温度的亮度分布
+- Material: 类似发射率的材料类别（从panoptic_img生成）
+- Context: 环境特征
+
+使用与ICEdit_contrastive完全相同的数据格式（parquet）
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import argparse
 import os
 import sys
+from pathlib import Path
 from tqdm import tqdm
+import argparse
 import yaml
+import numpy as np
 
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加项目路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from decomposition.model import MultiTaskDecompositionNet, PhysicsInspiredFusion
-from decomposition.losses import MultiTaskPretrainLoss, PerceptualLoss
-from decomposition.pseudo_labels import PseudoLabelGenerator
-from utils.data_utils import RGBInfraredDataset, create_dataloaders
-from utils.visualization import visualize_decomposition, plot_training_curves
+from decomposition.losses import MultiTaskPretrainLoss
+from decomposition.pseudo_labels import (
+    generate_pseudo_intensity,
+    generate_pseudo_material_from_panoptic,
+    generate_pseudo_context
+)
+from utils.parquet_dataloader import create_dataloaders
 
 
-def train_one_epoch(
-    model,
-    fusion_module,
-    dataloader,
-    loss_fn,
-    pseudo_gen,
-    optimizer,
-    device,
-    epoch,
-    writer=None,
-    log_interval=50
-):
-    """Train for one epoch"""
-    model.train()
-    fusion_module.train()
+class DecompositionTrainer:
+    """分解网络训练器"""
 
-    epoch_losses = {
-        'total': [],
-        'intensity': [],
-        'material': [],
-        'context': [],
-        'fusion': []
-    }
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        # 创建保存目录
+        self.save_dir = Path(config['save_dir'])
+        self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    for batch_idx, batch in enumerate(pbar):
-        rgb = batch['rgb'].to(device)
-        infrared = batch['infrared'].to(device)
-        image_ids = batch['image_id']
+        self.vis_dir = self.save_dir / 'visualizations'
+        self.vis_dir.mkdir(exist_ok=True)
 
-        # Generate pseudo-labels
-        pseudo_intensity, pseudo_material, pseudo_context = pseudo_gen(
-            rgb, infrared, image_ids
+        # TensorBoard
+        self.writer = SummaryWriter(log_dir=str(self.save_dir / 'logs'))
+
+        # 创建模型
+        print("🏗️  创建分解网络...")
+        self.model = MultiTaskDecompositionNet(
+            backbone=config['model']['backbone'],
+            pretrained=True,
+            num_material_classes=config['model']['num_material_classes'],
+            context_channels=config['model']['context_channels'],
+        ).to(self.device)
+
+        self.fusion_module = PhysicsInspiredFusion(
+            num_material_classes=config['model']['num_material_classes'],
+            context_channels=config['model']['context_channels'],
+            hidden_dim=64,
+        ).to(self.device)
+
+        print(f"   参数量: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
+
+        # 创建损失函数
+        self.criterion = MultiTaskPretrainLoss(
+            lambda_intensity=config['loss']['lambda_intensity'],
+            lambda_material=config['loss']['lambda_material'],
+            lambda_context=config['loss']['lambda_context'],
+            lambda_fusion=config['loss']['lambda_fusion'],
         )
 
-        # Forward pass
-        pred_intensity, pred_material_logits, pred_context = model(rgb)
-
-        # Physics-inspired fusion
-        fused_output = fusion_module(pred_intensity, pred_material_logits, pred_context)
-
-        # Compute loss
-        loss, loss_dict = loss_fn(
-            pred_intensity,
-            pred_material_logits,
-            pred_context,
-            fused_output,
-            pseudo_intensity,
-            pseudo_material,
-            pseudo_context,
-            infrared
+        # 创建优化器（包含model和fusion_module）
+        self.optimizer = optim.AdamW(
+            list(self.model.parameters()) + list(self.fusion_module.parameters()),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay'],
         )
 
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        # Log losses
-        for key in epoch_losses.keys():
-            epoch_losses[key].append(loss_dict[key])
-
-        # Update progress bar
-        pbar.set_postfix({'loss': f"{loss_dict['total']:.4f}"})
-
-        # Log to tensorboard
-        if writer and batch_idx % log_interval == 0:
-            global_step = epoch * len(dataloader) + batch_idx
-            for key, value in loss_dict.items():
-                writer.add_scalar(f'train/{key}_loss', value, global_step)
-
-    # Average losses for epoch
-    avg_losses = {k: sum(v) / len(v) for k, v in epoch_losses.items()}
-
-    return avg_losses
-
-
-@torch.no_grad()
-def validate(
-    model,
-    fusion_module,
-    dataloader,
-    loss_fn,
-    pseudo_gen,
-    device,
-    epoch,
-    writer=None,
-    save_vis_path=None
-):
-    """Validate the model"""
-    model.eval()
-    fusion_module.eval()
-
-    val_losses = {
-        'total': [],
-        'intensity': [],
-        'material': [],
-        'context': [],
-        'fusion': []
-    }
-
-    # For visualization
-    vis_batch = None
-
-    for batch in tqdm(dataloader, desc="Validation"):
-        rgb = batch['rgb'].to(device)
-        infrared = batch['infrared'].to(device)
-        image_ids = batch['image_id']
-
-        # Generate pseudo-labels
-        pseudo_intensity, pseudo_material, pseudo_context = pseudo_gen(
-            rgb, infrared, image_ids
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=config['training']['num_epochs'],
+            eta_min=config['training']['learning_rate'] * 0.01,
         )
 
-        # Forward pass
-        pred_intensity, pred_material_logits, pred_context = model(rgb)
-        fused_output = fusion_module(pred_intensity, pred_material_logits, pred_context)
+        # 训练状态
+        self.epoch = 0
+        self.global_step = 0
+        self.best_val_loss = float('inf')
 
-        # Compute loss
-        loss, loss_dict = loss_fn(
-            pred_intensity,
-            pred_material_logits,
-            pred_context,
-            fused_output,
-            pseudo_intensity,
-            pseudo_material,
-            pseudo_context,
-            infrared
-        )
+    def train_epoch(self, train_loader):
+        """训练一个epoch"""
+        self.model.train()
+        epoch_losses = {
+            'total': 0,
+            'intensity': 0,
+            'material': 0,
+            'context': 0,
+            'fusion': 0,
+        }
 
-        # Log losses
-        for key in val_losses.keys():
-            val_losses[key].append(loss_dict[key])
+        pbar = tqdm(train_loader, desc=f"Epoch {self.epoch}")
+        for batch_idx, batch in enumerate(pbar):
+            # 移动数据到GPU
+            rgb = batch['rgb'].to(self.device)
+            infrared = batch['infrared'].to(self.device)
+            semantic = batch['semantic'].to(self.device)
 
-        # Save first batch for visualization
-        if vis_batch is None:
-            vis_batch = {
-                'rgb': rgb,
-                'intensity': pred_intensity,
-                'material_logits': pred_material_logits,
-                'context': pred_context,
-                'infrared': infrared
-            }
+            # 生成伪标签
+            with torch.no_grad():
+                # Intensity: 从红外图像生成
+                ir_gray = infrared.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+                pseudo_intensity = generate_pseudo_intensity(ir_gray, normalize=True)
 
-    # Average losses
-    avg_losses = {k: sum(v) / len(v) for k, v in val_losses.items()}
+                # Material: 从panoptic分割图生成（推荐方法）
+                pseudo_material = generate_pseudo_material_from_panoptic(
+                    semantic,
+                    num_classes=self.config['model']['num_material_classes']
+                )
 
-    # Log to tensorboard
-    if writer:
-        for key, value in avg_losses.items():
-            writer.add_scalar(f'val/{key}_loss', value, epoch)
+                # Context: 从RGB-IR差异生成
+                pseudo_context = generate_pseudo_context(rgb, ir_gray)
 
-    # Visualize
-    if save_vis_path and vis_batch:
-        visualize_decomposition(
-            vis_batch['rgb'][:4],
-            vis_batch['intensity'][:4],
-            vis_batch['material_logits'][:4],
-            vis_batch['context'][:4],
-            vis_batch['infrared'][:4],
-            save_path=save_vis_path,
-            num_samples=4
-        )
+                # 目标红外图（用于fusion重建）
+                target_ir = ir_gray
 
-    return avg_losses
+            # 前向传播
+            pred_intensity, pred_material_logits, pred_context = self.model(rgb)
 
+            # Physics-inspired fusion
+            fused_output = self.fusion_module(pred_intensity, pred_material_logits, pred_context)
 
-def main(args):
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Create output directories
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    os.makedirs(args.vis_dir, exist_ok=True)
-
-    # Create dataloaders
-    print("Loading datasets...")
-    train_loader, val_loader = create_dataloaders(
-        train_root=args.train_data,
-        val_root=args.val_data,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        image_size=args.image_size
-    )
-
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-
-    # Create model
-    print("Creating model...")
-    model = MultiTaskDecompositionNet(
-        backbone=args.backbone,
-        pretrained=True,
-        num_material_classes=args.num_material_classes,
-        context_channels=args.context_channels
-    ).to(device)
-
-    fusion_module = PhysicsInspiredFusion(
-        num_material_classes=args.num_material_classes,
-        context_channels=args.context_channels,
-        hidden_dim=args.fusion_hidden_dim
-    ).to(device)
-
-    # Create loss function
-    loss_fn = MultiTaskPretrainLoss(
-        lambda_intensity=args.lambda_intensity,
-        lambda_material=args.lambda_material,
-        lambda_context=args.lambda_context,
-        lambda_fusion=args.lambda_fusion
-    ).to(device)
-
-    # Create pseudo-label generator
-    pseudo_gen = PseudoLabelGenerator(
-        num_material_classes=args.num_material_classes,
-        context_channels=args.context_channels,
-        material_method=args.material_method,
-        cache_materials=True
-    )
-
-    # Create optimizer
-    optimizer = optim.AdamW(
-        list(model.parameters()) + list(fusion_module.parameters()),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.num_epochs,
-        eta_min=args.learning_rate * 0.01
-    )
-
-    # Tensorboard writer
-    writer = SummaryWriter(log_dir=args.log_dir)
-
-    # Training loop
-    print("\nStarting training...")
-    best_val_loss = float('inf')
-
-    for epoch in range(args.num_epochs):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch+1}/{args.num_epochs}")
-        print(f"{'='*50}")
-
-        # Train
-        train_losses = train_one_epoch(
-            model, fusion_module, train_loader, loss_fn, pseudo_gen,
-            optimizer, device, epoch, writer, args.log_interval
-        )
-
-        print(f"Train Loss: {train_losses['total']:.4f}")
-
-        # Validate
-        if val_loader and (epoch + 1) % args.val_interval == 0:
-            vis_path = os.path.join(args.vis_dir, f"epoch_{epoch+1}.png")
-            val_losses = validate(
-                model, fusion_module, val_loader, loss_fn, pseudo_gen,
-                device, epoch, writer, vis_path
+            # 计算损失
+            loss, losses = self.criterion(
+                pred_intensity,
+                pred_material_logits,
+                pred_context,
+                fused_output,
+                pseudo_intensity,
+                pseudo_material,
+                pseudo_context,
+                target_ir
             )
 
-            print(f"Val Loss: {val_losses['total']:.4f}")
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
 
-            # Save best model
-            if val_losses['total'] < best_val_loss:
-                best_val_loss = val_losses['total']
-                checkpoint_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'fusion_state_dict': fusion_module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': train_losses['total'],
-                    'val_loss': val_losses['total']
-                }, checkpoint_path)
-                print(f"Saved best model to {checkpoint_path}")
+            # 梯度裁剪（包含model和fusion_module）
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.parameters()) + list(self.fusion_module.parameters()),
+                self.config['training']['grad_clip']
+            )
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f'epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'fusion_state_dict': fusion_module.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_losses['total']
-            }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+            self.optimizer.step()
 
-        # Step scheduler
-        scheduler.step()
+            # 记录损失
+            for key in epoch_losses.keys():
+                epoch_losses[key] += losses[key]
 
-    print("\nTraining completed!")
-    writer.close()
+            # 更新进度条
+            pbar.set_postfix({
+                'loss': f"{losses['total']:.4f}",
+                'fusion': f"{losses['fusion']:.4f}",
+            })
+
+            # TensorBoard记录
+            if self.global_step % 10 == 0:
+                for key, value in losses.items():
+                    self.writer.add_scalar(f'train/{key}_loss', value, self.global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+
+            self.global_step += 1
+
+        # 计算平均损失
+        for key in epoch_losses.keys():
+            epoch_losses[key] /= len(train_loader)
+
+        return epoch_losses
+
+    @torch.no_grad()
+    def validate(self, val_loader):
+        """验证"""
+        self.model.eval()
+        self.fusion_module.eval()
+        val_losses = {
+            'total': 0,
+            'intensity': 0,
+            'material': 0,
+            'context': 0,
+            'fusion': 0,
+        }
+
+        for batch in tqdm(val_loader, desc="Validation"):
+            rgb = batch['rgb'].to(self.device)
+            infrared = batch['infrared'].to(self.device)
+            semantic = batch['semantic'].to(self.device)
+
+            # 生成伪标签
+            ir_gray = infrared.mean(dim=1, keepdim=True)
+            pseudo_intensity = generate_pseudo_intensity(ir_gray, normalize=True)
+            pseudo_material = generate_pseudo_material_from_panoptic(
+                semantic,
+                num_classes=self.config['model']['num_material_classes']
+            )
+            pseudo_context = generate_pseudo_context(rgb, ir_gray)
+            target_ir = ir_gray
+
+            # 前向传播
+            pred_intensity, pred_material_logits, pred_context = self.model(rgb)
+            fused_output = self.fusion_module(pred_intensity, pred_material_logits, pred_context)
+
+            # 计算损失
+            loss, losses = self.criterion(
+                pred_intensity,
+                pred_material_logits,
+                pred_context,
+                fused_output,
+                pseudo_intensity,
+                pseudo_material,
+                pseudo_context,
+                target_ir
+            )
+
+            # 累积损失
+            for key in val_losses.keys():
+                val_losses[key] += losses[key]
+
+        # 计算平均损失
+        for key in val_losses.keys():
+            val_losses[key] /= len(val_loader)
+
+        return val_losses
+
+    def save_checkpoint(self, filename='checkpoint.pth', is_best=False):
+        """保存检查点"""
+        checkpoint = {
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'fusion_state_dict': self.fusion_module.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'config': self.config,
+        }
+
+        filepath = self.save_dir / filename
+        torch.save(checkpoint, filepath)
+        print(f"   💾 检查点已保存: {filepath}")
+
+        if is_best:
+            best_path = self.save_dir / 'best_model.pth'
+            torch.save(checkpoint, best_path)
+            print(f"   ⭐ 最佳模型已保存: {best_path}")
+
+    def train(self, train_loader, val_loader):
+        """完整训练流程"""
+        print("\n" + "=" * 70)
+        print("开始训练分解网络")
+        print("=" * 70)
+
+        num_epochs = self.config['training']['num_epochs']
+
+        for epoch in range(num_epochs):
+            self.epoch = epoch
+
+            # 训练
+            train_losses = self.train_epoch(train_loader)
+
+            # 验证
+            val_losses = self.validate(val_loader)
+
+            # 学习率调度
+            self.scheduler.step()
+
+            # 打印结果
+            print(f"\nEpoch {epoch}/{num_epochs}")
+            print(f"  Train Loss: {train_losses['total']:.4f} "
+                  f"(Int: {train_losses['intensity']:.4f}, "
+                  f"Mat: {train_losses['material']:.4f}, "
+                  f"Ctx: {train_losses['context']:.4f}, "
+                  f"Fus: {train_losses['fusion']:.4f})")
+            print(f"  Val Loss:   {val_losses['total']:.4f} "
+                  f"(Int: {val_losses['intensity']:.4f}, "
+                  f"Mat: {val_losses['material']:.4f}, "
+                  f"Ctx: {val_losses['context']:.4f}, "
+                  f"Fus: {val_losses['fusion']:.4f})")
+
+            # TensorBoard记录
+            for key, value in val_losses.items():
+                self.writer.add_scalar(f'val/{key}_loss', value, epoch)
+
+            # 保存检查点
+            is_best = val_losses['total'] < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_losses['total']
+
+            if (epoch + 1) % self.config['training']['save_interval'] == 0:
+                self.save_checkpoint(f'epoch_{epoch}.pth', is_best=is_best)
+
+        # 保存最终模型
+        self.save_checkpoint('final_model.pth')
+
+        print("\n" + "=" * 70)
+        print("✅ 训练完成!")
+        print(f"   最佳验证损失: {self.best_val_loss:.4f}")
+        print(f"   模型保存路径: {self.save_dir}")
+        print("=" * 70)
+
+        self.writer.close()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Pretrain Decomposition Network')
-
-    # Data arguments
-    parser.add_argument('--train_data', type=str, required=True,
-                       help='Path to training data root')
-    parser.add_argument('--val_data', type=str, default=None,
-                       help='Path to validation data root')
-    parser.add_argument('--image_size', type=int, default=512,
-                       help='Image size for training')
-
-    # Model arguments
-    parser.add_argument('--backbone', type=str, default='resnet50',
-                       choices=['resnet18', 'resnet50'],
-                       help='Backbone architecture')
-    parser.add_argument('--num_material_classes', type=int, default=32,
-                       help='Number of material classes')
-    parser.add_argument('--context_channels', type=int, default=8,
-                       help='Number of context channels')
-    parser.add_argument('--fusion_hidden_dim', type=int, default=64,
-                       help='Hidden dimension for fusion module')
-
-    # Loss arguments
-    parser.add_argument('--lambda_intensity', type=float, default=1.0,
-                       help='Weight for intensity loss')
-    parser.add_argument('--lambda_material', type=float, default=1.0,
-                       help='Weight for material loss')
-    parser.add_argument('--lambda_context', type=float, default=0.5,
-                       help='Weight for context loss')
-    parser.add_argument('--lambda_fusion', type=float, default=2.0,
-                       help='Weight for fusion reconstruction loss')
-
-    # Pseudo-label arguments
-    parser.add_argument('--material_method', type=str, default='simple',
-                       choices=['kmeans', 'simple'],
-                       help='Method for material pseudo-label generation')
-
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=8,
-                       help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100,
-                       help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loading workers')
-
-    # Logging arguments
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints/decomposition',
-                       help='Directory to save checkpoints')
-    parser.add_argument('--log_dir', type=str, default='./logs/decomposition',
-                       help='Directory for tensorboard logs')
-    parser.add_argument('--vis_dir', type=str, default='./visualizations/decomposition',
-                       help='Directory for visualizations')
-    parser.add_argument('--log_interval', type=int, default=50,
-                       help='Log interval (batches)')
-    parser.add_argument('--val_interval', type=int, default=1,
-                       help='Validation interval (epochs)')
-    parser.add_argument('--save_interval', type=int, default=10,
-                       help='Checkpoint save interval (epochs)')
-
-    # Config file (optional)
-    parser.add_argument('--config', type=str, default=None,
-                       help='Path to config YAML file (overrides command line args)')
+def main():
+    parser = argparse.ArgumentParser(description='预训练分解网络')
+    parser.add_argument('--config', type=str, required=True,
+                       help='配置文件路径')
+    parser.add_argument('--parquet', type=str, default=None,
+                       help='Parquet文件路径（覆盖配置文件）')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='批次大小（覆盖配置文件）')
+    parser.add_argument('--num_epochs', type=int, default=None,
+                       help='训练轮数（覆盖配置文件）')
 
     args = parser.parse_args()
 
-    # Load config file if provided
-    if args.config:
-        with open(args.config, 'r') as f:
-            config = yaml.safe_load(f)
-            for key, value in config.items():
-                setattr(args, key, value)
+    # 加载配置
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
 
-    main(args)
+    # 命令行参数覆盖
+    if args.parquet:
+        config['data']['parquet_path'] = args.parquet
+    if args.batch_size:
+        config['data']['batch_size'] = args.batch_size
+    if args.num_epochs:
+        config['training']['num_epochs'] = args.num_epochs
+
+    print("=" * 70)
+    print("配置信息:")
+    print("=" * 70)
+    print(f"  数据路径: {config['data']['parquet_path']}")
+    print(f"  批次大小: {config['data']['batch_size']}")
+    print(f"  训练轮数: {config['training']['num_epochs']}")
+    print(f"  学习率: {config['training']['learning_rate']}")
+    print(f"  保存路径: {config['save_dir']}")
+    print("=" * 70)
+
+    # 创建数据加载器
+    train_loader, val_loader = create_dataloaders(
+        parquet_path=config['data']['parquet_path'],
+        split_file=config['data']['split_file'],
+        batch_size=config['data']['batch_size'],
+        num_workers=config['data']['num_workers'],
+        image_size=config['data']['image_size'],
+        normalize=True,
+    )
+
+    # 创建训练器
+    trainer = DecompositionTrainer(config)
+
+    # 开始训练
+    trainer.train(train_loader, val_loader)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,59 +1,47 @@
-# Configuration for Stage 1: Decomposition Network Pretraining
+# ============================================================================
+# 阶段1: 分解网络预训练配置
+# ============================================================================
 
-# ============================================================================
-# Data Configuration
-# ============================================================================
-train_data: "./data/train"  # Path to training data (contains rgb/ and infrared/ subdirs)
-val_data: "./data/val"      # Path to validation data
-image_size: 512             # Input image size
+# 数据配置
+data:
+  # 数据集路径（需要修改为你的实际路径）
+  parquet_path: "/root/autodl-tmp/qyt_contrasctivew/lmr_contrastive/dataset/pid_llvip_dataset_fixed.parquet"
 
-# ============================================================================
-# Model Configuration
-# ============================================================================
-backbone: "resnet50"              # Backbone architecture: resnet18 or resnet50
-num_material_classes: 32          # Number of material classes for classification
-context_channels: 8               # Number of context feature channels
-fusion_hidden_dim: 64             # Hidden dimension for physics-inspired fusion
+  # 数据集划分文件
+  split_file: "./data/dataset_split.json"
 
-# ============================================================================
-# Loss Weights
-# ============================================================================
-lambda_intensity: 1.0    # Weight for intensity loss
-lambda_material: 1.0     # Weight for material classification loss
-lambda_context: 0.5      # Weight for context loss
-lambda_fusion: 2.0       # Weight for fusion reconstruction loss
+  # 数据加载参数
+  batch_size: 8
+  num_workers: 4
+  image_size: 512
 
-# ============================================================================
-# Pseudo-Label Generation
-# ============================================================================
-material_method: "simple"  # Method for material pseudo-labels: "kmeans" or "simple"
-                          # "simple" is faster, "kmeans" is more accurate
+# 模型配置
+model:
+  # Backbone架构 (resnet18 或 resnet50)
+  backbone: "resnet50"
 
-# ============================================================================
-# Training Configuration
-# ============================================================================
-batch_size: 8              # Batch size (adjust based on GPU memory)
-num_epochs: 100            # Number of training epochs
-learning_rate: 0.0001      # Initial learning rate (1e-4)
-weight_decay: 0.00001      # Weight decay for regularization (1e-5)
-num_workers: 4             # Number of data loading workers
+  # 材料类别数量
+  num_material_classes: 32
 
-# ============================================================================
-# Logging and Checkpointing
-# ============================================================================
-checkpoint_dir: "./checkpoints/decomposition"     # Directory for model checkpoints
-log_dir: "./logs/decomposition"                   # Directory for TensorBoard logs
-vis_dir: "./visualizations/decomposition"         # Directory for visualizations
+  # Context特征通道数
+  context_channels: 8
 
-log_interval: 50      # Log training metrics every N batches
-val_interval: 1       # Run validation every N epochs
-save_interval: 10     # Save checkpoint every N epochs
+# 损失函数权重
+loss:
+  lambda_intensity: 1.0    # Intensity分支权重
+  lambda_material: 1.0     # Material分支权重
+  lambda_context: 0.5      # Context分支权重
+  lambda_fusion: 2.0       # Fusion重建权重（最重要！）
 
-# ============================================================================
-# Notes
-# ============================================================================
-# - Adjust batch_size based on your GPU memory (8 for 24GB GPU, 4 for 12GB)
-# - Use "simple" material_method for faster training during development
-# - Use "kmeans" material_method for better quality (slower)
-# - lambda_fusion is highest because final infrared reconstruction is most important
-# - lambda_context is lower because context is more abstract
+# 训练配置
+training:
+  num_epochs: 50           # 训练轮数
+  learning_rate: 1.0e-4    # 学习率
+  weight_decay: 1.0e-5     # 权重衰减
+  grad_clip: 1.0           # 梯度裁剪
+
+  # 保存间隔
+  save_interval: 10        # 每N个epoch保存一次checkpoint
+
+# 保存路径
+save_dir: "./checkpoints/decomposition"

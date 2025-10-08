@@ -114,8 +114,11 @@ class IntensityDecoder(nn.Module):
             self.up3 = self._make_decoder_block(128, 64)
             self.up4 = self._make_decoder_block(64, 64)
 
-        # Final 1x1 conv to single channel
-        self.final_conv = nn.Conv2d(64, 1, kernel_size=1)
+        # Final 1x1 conv to single channel + Sigmoid (output [0, 1])
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(64, 1, kernel_size=1),
+            nn.Sigmoid()  # 确保输出 [0, 1] 范围
+        )
 
     def _make_decoder_block(self, in_ch, out_ch):
         return nn.Sequential(

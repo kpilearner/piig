@@ -41,9 +41,58 @@ def generate_pseudo_intensity(infrared_image, normalize=True):
     return pseudo_intensity
 
 
+def generate_pseudo_material_from_panoptic(semantic_image, num_classes=32):
+    """
+    从panoptic分割图直接生成材料伪标签（推荐）
+
+    Strategy: 使用panoptic_img中的颜色块作为材料类别
+    每个唯一的RGB颜色 = 一个对象实例 → 映射到材料类别
+
+    Args:
+        semantic_image: [B, 3, H, W] Panoptic分割图（RGB颜色块）
+        num_classes: 最大材料类别数
+
+    Returns:
+        pseudo_material: [B, H, W] Pseudo material labels (class indices)
+    """
+    B, _, H, W = semantic_image.shape
+    device = semantic_image.device
+
+    pseudo_material = torch.zeros(B, H, W, dtype=torch.long, device=device)
+
+    for i in range(B):
+        # 将RGB颜色转换为单一标签
+        rgb = semantic_image[i].permute(1, 2, 0)  # [H, W, 3]
+        rgb_int = (rgb * 255).long()  # 转换为整数
+
+        # 将RGB编码为单一整数: R * 256^2 + G * 256 + B
+        color_ids = rgb_int[:, :, 0] * 65536 + rgb_int[:, :, 1] * 256 + rgb_int[:, :, 2]
+
+        # 获取唯一颜色
+        unique_colors = torch.unique(color_ids)
+
+        # 映射到类别索引（限制在num_classes内）
+        color_to_class = {}
+        for idx, color in enumerate(unique_colors):
+            color_to_class[color.item()] = idx % num_classes
+
+        # 生成材料标签
+        material_labels = torch.zeros(H, W, dtype=torch.long, device=device)
+        for color, class_id in color_to_class.items():
+            mask = (color_ids == color)
+            material_labels[mask] = class_id
+
+        pseudo_material[i] = material_labels
+
+    return pseudo_material
+
+
 def generate_pseudo_material(rgb_image, infrared_image, num_classes=32, method='kmeans'):
     """
     Generate pseudo material labels using clustering on RGB-IR features.
+
+    ⚠️ 注意：如果你有panoptic_img，推荐使用 generate_pseudo_material_from_panoptic()
+    这个函数用于没有语义分割图的情况
 
     Strategy: Cluster image regions based on RGB+IR features.
     Assumption: Similar appearance + thermal behavior ≈ similar material.

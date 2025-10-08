@@ -1,0 +1,66 @@
+# ====================================================================
+# Stage 1: Thermal Query Decoder Pretraining Configuration
+# ====================================================================
+#
+# Goal: Train the ThermalQueryDecoder to learn thermal patterns
+#       from RGB → Infrared image pairs.
+#
+# This is a simpler, more stable alternative to the multi-task
+# decomposition network. No pseudo-labels needed!
+# ====================================================================
+
+# Data Configuration
+data:
+  parquet_path: "/root/autodl-tmp/qyt_contrasctivew/lmr_contrastive/dataset/pid_llvip_dataset_fixed.parquet"
+  split_file: "./data/dataset_split.json"
+
+  batch_size: 8          # Adjust based on GPU: 24GB=8, 12GB=4
+  num_workers: 4
+  image_size: 512
+  normalize: true        # Use ImageNet normalization for ResNet backbone
+
+# Model Configuration
+model:
+  backbone: "resnet50"   # 'resnet18' or 'resnet50'
+  pretrained: true       # Use ImageNet pretrained weights
+
+  # Thermal Query Decoder
+  num_thermal_queries: 256    # Number of learnable thermal patterns
+  hidden_dim: 256             # Hidden dimension for attention
+  num_scales: 3               # Use last 3 ResNet stages (1/8, 1/16, 1/32)
+  dec_layers: 9               # Number of Transformer decoder layers
+  nheads: 8                   # Number of attention heads
+  dim_feedforward: 2048       # FFN hidden dimension
+  pre_norm: false             # LayerNorm position
+
+# Loss Configuration
+loss:
+  type: "MSE"            # Simple MSE loss for infrared reconstruction
+  # No complex multi-task losses needed!
+
+# Training Configuration
+training:
+  num_epochs: 50
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+
+  # Learning rate scheduler
+  scheduler: "cosine"
+  warmup_epochs: 5
+
+  # Saving and logging
+  save_interval: 10      # Save checkpoint every N epochs
+  log_interval: 10       # Log metrics every N steps
+  val_interval: 1        # Validate every N epochs
+
+# Paths
+save_dir: "./checkpoints/thermal_query_decoder"
+tensorboard_dir: "./checkpoints/thermal_query_decoder/logs"
+
+# ====================================================================
+# Expected Results:
+# - Training loss should drop to ~0.05-0.1 (MSE)
+# - Validation loss should follow training without large gap
+# - Training time: ~6-8 hours for 50 epochs (ResNet50, 24GB GPU)
+# ====================================================================

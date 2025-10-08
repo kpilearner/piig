@@ -103,8 +103,28 @@ conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
 # Install dependencies
 pip install diffusers transformers accelerate peft
 pip install tensorboard matplotlib scikit-learn pyyaml tqdm
-pip install pillow numpy opencv-python
+pip install pillow numpy opencv-python datasets
 ```
+
+### 1.5. Configure Cache (Recommended)
+
+**Important**: Set cache paths to avoid repeated downloads and save disk space.
+
+```bash
+# Set HuggingFace cache location (same as ICEdit_contrastive)
+export HF_DATASETS_CACHE="/path/to/your/cache"  # e.g., "/root/autodl-tmp/.cache"
+export HUGGINGFACE_HUB_CACHE="/path/to/your/cache"
+
+# Add to ~/.bashrc for persistence
+echo 'export HF_DATASETS_CACHE="/path/to/your/cache"' >> ~/.bashrc
+echo 'export HUGGINGFACE_HUB_CACHE="/path/to/your/cache"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+This ensures:
+- No duplicate dataset downloads between Stage 1 and Stage 2
+- Consistent with ICEdit_contrastive caching strategy
+- Saves significant disk space
 
 ### 2. Prepare Data
 
